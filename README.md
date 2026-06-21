@@ -1,4 +1,4 @@
-# Project2-TinyGPTmodel
+# Project2-GPT2.0 model
  이 프로젝트는 gpt의 핵심 아이디어를 간단한 형태로 직접 구현한 모델이다. 모델은 input.txt에 들어 있는 글을 학습한 뒤, 앞에 나온 문자들을 바탕으로 다음 문자를 예측한다.
 
 # 1. 프로젝트 목표
