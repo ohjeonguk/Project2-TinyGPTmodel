@@ -1,0 +1,675 @@
+import argparse
+import os
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+
+# 1. 설정값
+@dataclass
+class GPTConfig:
+    vocab_size: int
+    block_size: int = 64      # 모델이 한 번에 보는 문맥 길이
+    n_embd: int = 128         # 임베딩 차원
+    n_head: int = 4           # attention head 개수
+    n_layer: int = 4          # transformer block 개수
+    dropout: float = 0.2
+
+
+# 2. 데이터 처리
+DEFAULT_TEXT = """
+나는 작은 언어 모델을 만든다.
+이 모델은 앞에 나온 글자들을 보고 다음 글자를 예측한다.
+처음에는 아무것도 모르지만, 여러 번 학습하면서 글자의 패턴을 배운다.
+GPT의 핵심 아이디어는 문맥을 보고 다음 토큰을 예측하는 것이다.
+이 프로젝트에서는 문자 단위로 토큰을 만들고, 작은 Transformer 모델을 학습한다.
+"""
+
+
+def load_text(input_file: str) -> str:
+    """텍스트 파일을 읽는다. 파일이 없으면 기본 예시 문장을 사용한다."""
+    if input_file and os.path.exists(input_file):
+        with open(input_file, "r", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        print(f"[알림] {input_file} 파일을 찾지 못해서 기본 예시 문장으로 학습합니다.")
+        text = DEFAULT_TEXT
+
+    text = text.strip()
+
+    if len(text) < 20:
+        raise ValueError("학습할 텍스트가 너무 짧습니다. input.txt에 더 긴 글을 넣어주세요.")
+
+    return text
+
+
+def build_vocab(text: str):
+    """
+    문자 단위 vocabulary를 만든다.
+
+    stoi: string to integer
+    itos: integer to string
+    """
+    chars = sorted(list(set(text)))
+
+    stoi = {ch: i for i, ch in enumerate(chars)}
+    itos = {i: ch for i, ch in enumerate(chars)}
+
+    def encode(s: str):
+        return [stoi[c] for c in s]
+
+    def decode(ids):
+        return "".join([itos[int(i)] for i in ids])
+
+    return chars, stoi, itos, encode, decode
+
+
+def make_train_val_data(text: str, encode, device: str, block_size: int):
+    """전체 텍스트를 train/validation 데이터로 나눈다."""
+    data = torch.tensor(encode(text), dtype=torch.long)
+
+    minimum_length = block_size + 2
+
+    if len(data) < minimum_length:
+        repeat_count = minimum_length // len(data) + 2
+        data = data.repeat(repeat_count)
+
+    n = int(0.9 * len(data))
+
+    train_data = data[:n].to(device)
+    val_data = data[n:].to(device)
+
+    if len(val_data) <= block_size:
+        val_data = train_data[-(block_size + 2):]
+
+    return train_data, val_data
+
+
+def get_batch(split: str, train_data, val_data, block_size: int, batch_size: int, device: str):
+    """
+    학습용 batch를 만든다.
+
+    예를 들어 원래 문장이 다음과 같다고 하자.
+
+        나는 오늘 밥을 먹었다
+
+    그러면 입력 x와 정답 y는 한 칸씩 밀린 형태가 된다.
+
+        x = 나는 오늘 밥을 먹었
+        y = 는 오늘 밥을 먹었다
+
+    즉, 모델은 현재까지의 글자를 보고 다음 글자를 예측하도록 학습된다.
+    """
+    data = train_data if split == "train" else val_data
+
+    max_start = len(data) - block_size - 1
+
+    if max_start <= 0:
+        raise ValueError("데이터가 너무 짧아서 batch를 만들 수 없습니다.")
+
+    ix = torch.randint(max_start, (batch_size,), device=device)
+
+    x = torch.stack([data[i:i + block_size] for i in ix])
+    y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
+
+    return x, y
+
+
+# 3. GPT 구성 요소
+class Head(nn.Module):
+    """
+    Masked Self-Attention Head 하나.
+
+    Attention은 현재 토큰이 이전 토큰들 중 어디를 중요하게 볼지 계산한다.
+    Masked Attention이므로 미래 토큰은 볼 수 없다.
+    """
+
+    def __init__(self, n_embd: int, head_size: int, block_size: int, dropout: float):
+        super().__init__()
+
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+
+        # 미래 위치를 보지 못하게 하기 위한 lower triangular mask
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+
+        k = self.key(x)
+        q = self.query(x)
+
+        # query와 key의 유사도를 통해 attention score 계산
+        wei = q @ k.transpose(-2, -1) * (k.shape[-1] ** -0.5)
+
+        # 현재 시점보다 뒤에 있는 미래 토큰은 참고하지 못하도록 막는다.
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+
+        # attention score를 확률분포로 바꾼다.
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+
+        v = self.value(x)
+
+        # attention weight를 value에 곱해서 문맥 정보 생성
+        out = wei @ v
+
+        return out
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    여러 개의 attention head를 병렬로 사용한다.
+
+    하나의 head는 한 가지 관점에서 문맥을 보고,
+    여러 head를 쓰면 다양한 관점에서 문맥을 볼 수 있다.
+    """
+
+    def __init__(self, n_embd: int, n_head: int, block_size: int, dropout: float):
+        super().__init__()
+
+        head_size = n_embd // n_head
+
+        self.heads = nn.ModuleList([
+            Head(n_embd, head_size, block_size, dropout)
+            for _ in range(n_head)
+        ])
+
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # 각 head의 출력을 마지막 차원에서 이어붙인다.
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+
+        # 여러 head의 결과를 다시 하나의 벡터 공간으로 projection
+        out = self.proj(out)
+        out = self.dropout(out)
+
+        return out
+
+
+class FeedForward(nn.Module):
+    """
+    각 위치의 토큰 벡터에 독립적으로 적용되는 작은 MLP.
+
+    Attention이 토큰들 사이의 관계를 보는 부분이라면,
+    FeedForward는 각 토큰의 표현을 더 깊게 변환하는 부분이다.
+    """
+
+    def __init__(self, n_embd: int, dropout: float):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class Block(nn.Module):
+    """
+    Transformer Block.
+
+    구성:
+    1. LayerNorm
+    2. Masked Multi-Head Self-Attention
+    3. Residual Connection
+    4. LayerNorm
+    5. FeedForward Network
+    6. Residual Connection
+    """
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+
+        self.sa = MultiHeadAttention(
+            n_embd=config.n_embd,
+            n_head=config.n_head,
+            block_size=config.block_size,
+            dropout=config.dropout,
+        )
+
+        self.ffwd = FeedForward(config.n_embd, config.dropout)
+
+        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln2 = nn.LayerNorm(config.n_embd)
+
+    def forward(self, x):
+        # Residual connection:
+        # 기존 x에 attention 결과를 더해서 정보가 잘 흐르도록 한다.
+        x = x + self.sa(self.ln1(x))
+
+        # 다시 기존 x에 feedforward 결과를 더한다.
+        x = x + self.ffwd(self.ln2(x))
+
+        return x
+
+
+class TinyGPT(nn.Module):
+    """
+    문자 단위 GPT 모델.
+
+    입력:
+        문자 id들의 sequence
+
+    출력:
+        각 위치에서 다음 문자에 대한 확률분포
+    """
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+
+        self.config = config
+
+        # token embedding: 문자 id를 벡터로 바꾼다.
+        self.token_embedding_table = nn.Embedding(
+            config.vocab_size,
+            config.n_embd
+        )
+
+        # position embedding: 각 문자의 위치 정보를 벡터로 표현한다.
+        self.position_embedding_table = nn.Embedding(
+            config.block_size,
+            config.n_embd
+        )
+
+        # transformer block 여러 개 쌓기
+        self.blocks = nn.Sequential(*[
+            Block(config)
+            for _ in range(config.n_layer)
+        ])
+
+        self.ln_f = nn.LayerNorm(config.n_embd)
+
+        # 최종적으로 각 위치마다 vocab_size개의 점수를 출력한다.
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """모델 가중치 초기화"""
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        """
+        idx:
+            입력 문자 id
+            shape = (batch_size, sequence_length)
+
+        targets:
+            정답 문자 id
+            shape = (batch_size, sequence_length)
+        """
+        B, T = idx.shape
+
+        if T > self.config.block_size:
+            raise ValueError(
+                f"입력 길이 T={T}가 block_size={self.config.block_size}보다 큽니다."
+            )
+
+        # 문자 id를 embedding vector로 변환
+        tok_emb = self.token_embedding_table(idx)
+
+        # 위치 정보를 embedding vector로 변환
+        pos = torch.arange(T, device=idx.device)
+        pos_emb = self.position_embedding_table(pos)
+
+        # token embedding과 position embedding을 더한다.
+        x = tok_emb + pos_emb
+
+        # transformer blocks 통과
+        x = self.blocks(x)
+
+        # 마지막 layer normalization
+        x = self.ln_f(x)
+
+        # 각 위치에서 다음 문자 후보들에 대한 점수 계산
+        logits = self.lm_head(x)
+
+        loss = None
+
+        if targets is not None:
+            B, T, C = logits.shape
+
+            logits_for_loss = logits.view(B * T, C)
+            targets_for_loss = targets.view(B * T)
+
+            loss = F.cross_entropy(logits_for_loss, targets_for_loss)
+
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens: int):
+        """
+        현재까지의 문자들을 바탕으로 새로운 문자를 생성한다.
+
+        idx:
+            현재까지의 문자 id
+            shape = (1, 현재 문장 길이)
+
+        max_new_tokens:
+            새로 생성할 문자 개수
+        """
+        for _ in range(max_new_tokens):
+            # block_size보다 긴 문맥은 마지막 block_size개만 사용
+            idx_cond = idx[:, -self.config.block_size:]
+
+            # 모델 예측
+            logits, loss = self(idx_cond)
+
+            # 마지막 위치의 예측만 사용
+            logits = logits[:, -1, :]
+
+            # softmax로 확률분포 만들기
+            probs = F.softmax(logits, dim=-1)
+
+            # 확률분포에서 다음 문자 하나 샘플링
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+            # 기존 sequence 뒤에 새 문자 붙이기
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+
+# 4. 학습과 평가
+@torch.no_grad()
+def estimate_loss(
+    model,
+    train_data,
+    val_data,
+    config,
+    batch_size,
+    device,
+    eval_iters=20
+):
+    """
+    train loss와 validation loss를 대략적으로 계산한다.
+    """
+    out = {}
+
+    model.eval()
+
+    for split in ["train", "val"]:
+        losses = torch.zeros(eval_iters)
+
+        for k in range(eval_iters):
+            X, Y = get_batch(
+                split,
+                train_data,
+                val_data,
+                config.block_size,
+                batch_size,
+                device
+            )
+
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+
+        out[split] = losses.mean().item()
+
+    model.train()
+
+    return out
+
+
+def train_model(model, train_data, val_data, config, args, device):
+    """
+    모델을 학습한다.
+    """
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate
+    )
+
+    for iter_num in range(args.max_iters + 1):
+        if iter_num % args.eval_interval == 0:
+            losses = estimate_loss(
+                model=model,
+                train_data=train_data,
+                val_data=val_data,
+                config=config,
+                batch_size=args.batch_size,
+                device=device,
+                eval_iters=args.eval_iters,
+            )
+
+            print(
+                f"step {iter_num:5d} | "
+                f"train loss {losses['train']:.4f} | "
+                f"val loss {losses['val']:.4f}"
+            )
+
+        xb, yb = get_batch(
+            "train",
+            train_data,
+            val_data,
+            config.block_size,
+            args.batch_size,
+            device
+        )
+
+        logits, loss = model(xb, yb)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+
+# 5. 저장과 불러오기
+def save_checkpoint(path, model, config, chars, stoi, itos):
+    """
+    학습된 모델과 vocabulary를 저장한다.
+    """
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "config": config.__dict__,
+        "chars": chars,
+        "stoi": stoi,
+        "itos": itos,
+    }
+
+    torch.save(checkpoint, path)
+
+    print(f"[저장 완료] {path}")
+
+
+def load_checkpoint(path, device):
+    """
+    저장된 모델과 vocabulary를 불러온다.
+    """
+    checkpoint = torch.load(path, map_location=device)
+
+    config = GPTConfig(**checkpoint["config"])
+
+    model = TinyGPT(config).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    chars = checkpoint["chars"]
+    stoi = checkpoint["stoi"]
+    itos = checkpoint["itos"]
+
+    def encode(s: str):
+        # 저장된 vocabulary에 없는 문자는 무시한다.
+        return [stoi[c] for c in s if c in stoi]
+
+    def decode(ids):
+        return "".join([itos[int(i)] for i in ids])
+
+    return model, config, chars, stoi, itos, encode, decode
+
+
+# 6. main 함수
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="문자 단위 Tiny GPT 학습 코드"
+    )
+
+    parser.add_argument("--input_file", type=str, default="input.txt")
+    parser.add_argument("--checkpoint", type=str, default="tiny_gpt_checkpoint.pt")
+
+    parser.add_argument("--block_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=32)
+
+    parser.add_argument("--max_iters", type=int, default=1500)
+    parser.add_argument("--eval_interval", type=int, default=100)
+    parser.add_argument("--eval_iters", type=int, default=20)
+
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+
+    parser.add_argument("--n_embd", type=int, default=128)
+    parser.add_argument("--n_head", type=int, default=4)
+    parser.add_argument("--n_layer", type=int, default=4)
+
+    parser.add_argument("--dropout", type=float, default=0.2)
+
+    parser.add_argument("--max_new_tokens", type=int, default=300)
+    parser.add_argument("--start_text", type=str, default="\n")
+
+    parser.add_argument("--generate_only", action="store_true")
+    parser.add_argument("--cpu", action="store_true")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    torch.manual_seed(1337)
+
+    device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
+
+    print(f"[device] {device}")
+
+    # 생성만 하는 경우
+    if args.generate_only:
+        if not os.path.exists(args.checkpoint):
+            raise FileNotFoundError(
+                f"{args.checkpoint} 파일이 없습니다. 먼저 학습을 진행해주세요."
+            )
+
+        model, config, chars, stoi, itos, encode, decode = load_checkpoint(
+            args.checkpoint,
+            device
+        )
+
+        start_ids = encode(args.start_text)
+
+        if len(start_ids) == 0:
+            start_ids = [0]
+
+        context = torch.tensor(
+            [start_ids],
+            dtype=torch.long,
+            device=device
+        )
+
+        generated = model.generate(
+            context,
+            max_new_tokens=args.max_new_tokens
+        )[0].tolist()
+
+        print("\n========== 생성 결과 ==========")
+        print(decode(generated))
+
+        return
+
+    # 1. 데이터 로딩
+    text = load_text(args.input_file)
+
+    chars, stoi, itos, encode, decode = build_vocab(text)
+
+    vocab_size = len(chars)
+
+    print(f"[데이터 길이] {len(text)} 글자")
+    print(f"[vocab size] {vocab_size}")
+    print(f"[vocab 예시] {''.join(chars[:50])}")
+
+    # 2. 설정 생성
+    if args.n_embd % args.n_head != 0:
+        raise ValueError("n_embd는 n_head로 나누어 떨어져야 합니다.")
+
+    config = GPTConfig(
+        vocab_size=vocab_size,
+        block_size=args.block_size,
+        n_embd=args.n_embd,
+        n_head=args.n_head,
+        n_layer=args.n_layer,
+        dropout=args.dropout,
+    )
+
+    train_data, val_data = make_train_val_data(
+        text,
+        encode,
+        device,
+        config.block_size
+    )
+
+    # 3. 모델 생성
+    model = TinyGPT(config).to(device)
+
+    num_params = sum(p.numel() for p in model.parameters())
+
+    print(f"[모델 파라미터 수] {num_params:,}")
+
+    # 4. 학습
+    train_model(
+        model,
+        train_data,
+        val_data,
+        config,
+        args,
+        device
+    )
+
+    # 5. 학습 후 생성
+    start_ids = encode(args.start_text)
+
+    if len(start_ids) == 0:
+        start_ids = [0]
+
+    context = torch.tensor(
+        [start_ids],
+        dtype=torch.long,
+        device=device
+    )
+
+    generated = model.generate(
+        context,
+        max_new_tokens=args.max_new_tokens
+    )[0].tolist()
+
+    print("\n========== 생성 결과 ==========")
+    print(decode(generated))
+
+    # 6. 모델 저장
+    save_checkpoint(
+        args.checkpoint,
+        model,
+        config,
+        chars,
+        stoi,
+        itos
+    )
+
+
+if __name__ == "__main__":
+    main()
